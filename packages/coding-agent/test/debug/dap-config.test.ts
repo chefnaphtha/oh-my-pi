@@ -8,11 +8,18 @@ import { injectPluginDirRoots } from "../../src/discovery/helpers";
 const tempDirs: string[] = [];
 const ORIGINAL_OMP_PLUGIN_DIR = process.env.OMP_PLUGIN_DIR;
 const ORIGINAL_OMP_MARKETPLACE_DIR = process.env.OMP_MARKETPLACE_DIR;
+const ORIGINAL_PATH = process.env.PATH;
 
 async function makeTempDir(prefix: string): Promise<string> {
 	const cwd = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
 	tempDirs.push(cwd);
 	return cwd;
+}
+
+async function writeExecutable(filePath: string): Promise<void> {
+	await fs.mkdir(path.dirname(filePath), { recursive: true });
+	await fs.writeFile(filePath, process.platform === "win32" ? "@echo off\r\n" : "#!/bin/sh\n");
+	await fs.chmod(filePath, 0o755);
 }
 
 afterEach(async () => {
@@ -26,6 +33,11 @@ afterEach(async () => {
 		delete process.env.OMP_MARKETPLACE_DIR;
 	} else {
 		process.env.OMP_MARKETPLACE_DIR = ORIGINAL_OMP_MARKETPLACE_DIR;
+	}
+	if (ORIGINAL_PATH === undefined) {
+		delete process.env.PATH;
+	} else {
+		process.env.PATH = ORIGINAL_PATH;
 	}
 	await injectPluginDirRoots(os.homedir(), []);
 	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
@@ -194,5 +206,91 @@ describe("DAP adapter configuration", () => {
 		const config = getAdapterConfigs(cwd);
 		expect(config["missing-command"]).toBeUndefined();
 		expect(config.valid?.command).toBe("bun");
+	});
+
+	it("does not fall back to native adapters when dlv is the matching Go source adapter but unavailable", async () => {
+		const cwd = await makeTempDir("omp-dap-go-dlv-missing-");
+		const pathDir = path.join(cwd, "empty-path");
+		process.env.PATH = pathDir;
+		await fs.mkdir(pathDir);
+		await fs.writeFile(path.join(cwd, "go.mod"), "module example.com/app\n\ngo 1.22\n");
+		await fs.writeFile(path.join(cwd, "main.go"), "package main\n\nfunc main() {}\n");
+		await writeExecutable(path.join(cwd, "bin", "gdb"));
+		await writeExecutable(path.join(cwd, "bin", "lldb-dap"));
+		await fs.writeFile(
+			path.join(cwd, "dap.json"),
+			JSON.stringify({
+				adapters: {
+					dlv: { command: "./bin/missing-dlv" },
+					gdb: { command: "./bin/gdb" },
+					"lldb-dap": { command: "./bin/lldb-dap" },
+				},
+			}),
+		);
+
+		const selected = selectLaunchAdapter(path.join(cwd, "main.go"), cwd);
+
+		expect(selected).toBeNull();
+	});
+
+	it("matches dlv for nested Go package directories using the launch program ancestry", async () => {
+		const cwd = await makeTempDir("omp-dap-go-nested-");
+		const program = path.join(cwd, "services", "checkout", "cmd", "api");
+		const pathDir = path.join(cwd, "empty-path");
+		process.env.PATH = pathDir;
+		await fs.mkdir(pathDir);
+		await fs.writeFile(path.join(cwd, "Makefile"), "all:\n\tgo build ./...\n");
+		await fs.mkdir(path.join(cwd, "services", "checkout"), { recursive: true });
+		await fs.writeFile(path.join(cwd, "services", "checkout", "go.mod"), "module example.com/checkout\n\ngo 1.22\n");
+		await fs.mkdir(program, { recursive: true });
+		await writeExecutable(path.join(cwd, "bin", "dlv"));
+		await writeExecutable(path.join(cwd, "bin", "gdb"));
+		await fs.writeFile(
+			path.join(cwd, "dap.json"),
+			JSON.stringify({
+				adapters: {
+					dlv: { command: "./bin/dlv" },
+					gdb: { command: "./bin/gdb" },
+				},
+			}),
+		);
+
+		const selected = selectLaunchAdapter(program, cwd, undefined, "directory");
+
+		expect(selected?.name).toBe("dlv");
+		expect(selected?.resolvedCommand).toBe(path.join(cwd, "bin", "dlv"));
+	});
+
+	it("selects dlv for Go workspace directories rooted by go.work", async () => {
+		const cwd = await makeTempDir("omp-dap-go-work-");
+		const program = path.join(cwd, "cmd", "worker");
+		const pathDir = path.join(cwd, "empty-path");
+		process.env.PATH = pathDir;
+		await fs.mkdir(pathDir);
+		await fs.writeFile(path.join(cwd, "go.work"), "go 1.22\n\nuse ./cmd/worker\n");
+		await fs.mkdir(program, { recursive: true });
+		await writeExecutable(path.join(cwd, "bin", "dlv"));
+
+		const selected = selectLaunchAdapter(program, cwd, undefined, "directory");
+
+		expect(selected?.resolvedCommand).toBe(path.join(cwd, "bin", "dlv"));
+	});
+
+	it("re-resolves dlv after an earlier PATH lookup missed it", async () => {
+		const cwd = await makeTempDir("omp-dap-go-dlv-cache-");
+		const pathDir = path.join(cwd, "path-bin");
+		const program = path.join(cwd, "main.go");
+		await fs.mkdir(pathDir);
+		process.env.PATH = pathDir;
+		await fs.writeFile(path.join(cwd, "go.mod"), "module example.com/cache\n\ngo 1.22\n");
+		await fs.writeFile(program, "package main\n\nfunc main() {}\n");
+
+		expect(selectLaunchAdapter(program, cwd)).toBeNull();
+
+		await writeExecutable(path.join(pathDir, "dlv"));
+		const selected = selectLaunchAdapter(program, cwd);
+
+		expect(selected?.name).toBe("dlv");
+		expect(selected?.resolvedCommand).toBe(path.join(pathDir, "dlv"));
 	});
 });

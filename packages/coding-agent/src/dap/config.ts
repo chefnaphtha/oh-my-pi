@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { isRecord, logger } from "@oh-my-pi/pi-utils";
+import { isRecord, logger, WhichCachePolicy } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
 import { getConfigDirPaths } from "../config";
 import { getPreloadedPluginRoots } from "../discovery/helpers";
@@ -191,7 +191,9 @@ function resolveAdapterFromConfig(
 ): DapResolvedAdapter | null {
 	const config = configs[adapterName];
 	if (!config) return null;
-	const resolvedCommand = resolveCommand(normalizeCommandForCwd(config.command, cwd), cwd);
+	const resolvedCommand = resolveCommand(normalizeCommandForCwd(config.command, cwd), cwd, {
+		cache: WhichCachePolicy.Fresh,
+	});
 	if (!resolvedCommand) return null;
 	return {
 		name: adapterName,
@@ -214,38 +216,83 @@ export function resolveAdapter(adapterName: string, cwd: string): DapResolvedAda
 
 export function getAvailableAdapters(cwd: string): DapResolvedAdapter[] {
 	const configs = getAdapterConfigs(cwd);
-	return Object.keys(configs)
-		.map(name => resolveAdapterFromConfig(name, configs, cwd))
-		.filter((adapter): adapter is DapResolvedAdapter => adapter !== null);
-}
-
-function getMatchingAdapters(program: string, cwd: string): DapResolvedAdapter[] {
-	const extension = path.extname(program).toLowerCase();
-	const available = getAvailableAdapters(cwd);
-	if (!extension) {
-		// For extensionless binaries, only consider native debuggers (gdb, lldb-dap)
-		// or adapters that match by root markers. Don't silently fall back to
-		// unrelated adapters like debugpy for a C binary.
-		const nativeDebuggers: ReadonlySet<string> = new Set(EXTENSIONLESS_DEBUGGER_ORDER);
-		return available.filter(
-			adapter =>
-				nativeDebuggers.has(adapter.name) ||
-				(adapter.rootMarkers.length > 0 && hasRootMarkers(cwd, adapter.rootMarkers)),
-		);
-	}
-	const exactMatches = available.filter(adapter => adapter.fileTypes.includes(extension));
-	if (exactMatches.length > 0) {
-		return exactMatches;
+	const available: DapResolvedAdapter[] = [];
+	for (const name in configs) {
+		const adapter = resolveAdapterFromConfig(name, configs, cwd);
+		if (adapter) available.push(adapter);
 	}
 	return available;
 }
 
-function sortAdaptersForLaunch(program: string, cwd: string, adapters: DapResolvedAdapter[]): DapResolvedAdapter[] {
+function hasRootMarkersInLaunchAncestry(
+	program: string,
+	cwd: string,
+	markers: string[],
+	programKind: LaunchProgramKind,
+): boolean {
+	if (markers.length === 0) return false;
+
+	let dir = programKind === "directory" ? path.resolve(cwd, program) : path.dirname(path.resolve(cwd, program));
+	while (true) {
+		if (hasRootMarkers(dir, markers)) return true;
+		const parent = path.dirname(dir);
+		if (parent === dir) return false;
+		dir = parent;
+	}
+}
+
+function getMatchingAdapters(program: string, cwd: string, programKind: LaunchProgramKind): DapResolvedAdapter[] {
+	const extension = path.extname(program).toLowerCase();
+	const configs = getAdapterConfigs(cwd);
+	const available: DapResolvedAdapter[] = [];
+	for (const name in configs) {
+		const adapter = resolveAdapterFromConfig(name, configs, cwd);
+		if (adapter) available.push(adapter);
+	}
+
+	if (extension) {
+		let hasConfiguredExtensionMatch = false;
+		for (const name in configs) {
+			const config = configs[name];
+			if (!config) continue;
+			hasConfiguredExtensionMatch ||= (config.fileTypes ?? []).includes(extension);
+		}
+
+		const exactMatches = available.filter(adapter => adapter.fileTypes.includes(extension));
+		if (exactMatches.length > 0) return exactMatches;
+		return hasConfiguredExtensionMatch ? [] : available;
+	}
+
+	const rootMatchedConfigNames = new Set<string>();
+	let hasDirectoryRootMatch = false;
+	for (const name in configs) {
+		const config = configs[name];
+		if (!config) continue;
+		if (!hasRootMarkersInLaunchAncestry(program, cwd, config.rootMarkers ?? [], programKind)) continue;
+		rootMatchedConfigNames.add(name);
+		if (config.acceptsDirectoryProgram === true) hasDirectoryRootMatch = true;
+	}
+
+	if (programKind === "directory" && hasDirectoryRootMatch) {
+		return available.filter(adapter => adapter.acceptsDirectoryProgram && rootMatchedConfigNames.has(adapter.name));
+	}
+
+	return available.filter(
+		adapter => adapter.name === "gdb" || adapter.name === "lldb-dap" || rootMatchedConfigNames.has(adapter.name),
+	);
+}
+
+function sortAdaptersForLaunch(
+	program: string,
+	cwd: string,
+	programKind: LaunchProgramKind,
+	adapters: DapResolvedAdapter[],
+): DapResolvedAdapter[] {
 	const extension = path.extname(program).toLowerCase();
 	const rootAware = adapters.map(adapter => ({
 		adapter,
 		hasExtensionMatch: extension.length > 0 && adapter.fileTypes.includes(extension),
-		hasRootMatch: adapter.rootMarkers.length > 0 && hasRootMarkers(cwd, adapter.rootMarkers),
+		hasRootMatch: hasRootMarkersInLaunchAncestry(program, cwd, adapter.rootMarkers, programKind),
 	}));
 	rootAware.sort((left, right) => {
 		if (left.hasExtensionMatch !== right.hasExtensionMatch) {
@@ -270,6 +317,37 @@ function sortAdaptersForLaunch(program: string, cwd: string, adapters: DapResolv
 	return rootAware.map(entry => entry.adapter);
 }
 
+export function getUnavailableLaunchAdapterName(
+	program: string,
+	cwd: string,
+	adapterName: string | undefined,
+	programKind: LaunchProgramKind,
+): string | null {
+	const configs = getAdapterConfigs(cwd);
+	if (adapterName) {
+		if (!configs[adapterName]) return null;
+		return resolveAdapterFromConfig(adapterName, configs, cwd) ? null : adapterName;
+	}
+
+	const extension = path.extname(program).toLowerCase();
+	const candidates: string[] = [];
+	for (const name in configs) {
+		const config = configs[name];
+		if (!config) continue;
+		if (extension) {
+			if ((config.fileTypes ?? []).includes(extension)) candidates.push(name);
+			continue;
+		}
+		if (programKind === "directory" && config.acceptsDirectoryProgram !== true) continue;
+		if (hasRootMarkersInLaunchAncestry(program, cwd, config.rootMarkers ?? [], programKind)) candidates.push(name);
+	}
+
+	for (const name of candidates) {
+		if (!resolveAdapterFromConfig(name, configs, cwd)) return name;
+	}
+	return null;
+}
+
 export function selectLaunchAdapter(
 	program: string,
 	cwd: string,
@@ -279,10 +357,10 @@ export function selectLaunchAdapter(
 	if (adapterName) {
 		return resolveAdapter(adapterName, cwd);
 	}
-	const matches = getMatchingAdapters(program, cwd);
+	const matches = getMatchingAdapters(program, cwd, programKind);
 	const candidates =
 		programKind === "directory" ? matches.filter(adapter => adapter.acceptsDirectoryProgram) : matches;
-	const sorted = sortAdaptersForLaunch(program, cwd, candidates.length > 0 ? candidates : matches);
+	const sorted = sortAdaptersForLaunch(program, cwd, programKind, candidates.length > 0 ? candidates : matches);
 	return sorted[0] ?? null;
 }
 
